@@ -33,18 +33,22 @@ from app.services.rag.vector_store import MilvusUnavailableError
 
 
 def _cors_origins() -> list[str]:
+    """把配置中的逗号分隔来源转换成 CORS 中间件需要的列表。"""
     return [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
 
 
 def _cors_origin_regex() -> str | None:
+    """开发环境额外允许本机任意端口；生产环境只使用显式配置的来源。"""
     if settings.app_env.lower() == "production":
         return None
     return r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
 
 def create_app() -> FastAPI:
+    """集中注册 API、错误处理和应用生命周期任务。"""
     app = FastAPI(title=settings.app_name, version="0.1.0")
 
+    # 将向量库故障统一转换为 503，便于客户端区分服务降级与普通请求错误。
     @app.exception_handler(MilvusUnavailableError)
     async def milvus_unavailable_handler(_request, exc: MilvusUnavailableError) -> JSONResponse:
         return JSONResponse(
@@ -60,6 +64,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # 最终路径由这里的 prefix 与各路由文件中的路径拼接；tags 用于 OpenAPI 分组。
     app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
     app.include_router(conversations.router, prefix="/api/repos", tags=["conversations"])
     app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
@@ -86,6 +91,7 @@ def create_app() -> FastAPI:
     async def create_demo_tables() -> None:
         # 课程项目默认自动建表；生产风格流程会在后续加入 Alembic 迁移。
         Base.metadata.create_all(bind=engine)
+        # create_all 不会修改已有表，因此下面按列是否存在来兼容旧数据库。
         inspector = inspect(engine)
         if "users" in inspector.get_table_names():
             columns = {column["name"] for column in inspector.get_columns("users")}
@@ -136,8 +142,11 @@ def create_app() -> FastAPI:
         if "documents" in inspector.get_table_names():
             document_columns = {column["name"] for column in inspector.get_columns("documents")}
             if "embedding" in document_columns:
+                # 向量数据已移至 Milvus，清理旧表中不再使用的 embedding 列。
                 with engine.begin() as connection:
                     connection.execute(text("ALTER TABLE documents DROP COLUMN embedding"))
+
+        # 这些导入只在启动时的数据修复阶段使用。
         from app.db.session import SessionLocal
         from app.services.conversations import backfill_all_default_conversations
         from app.services.code_analysis import purge_legacy_code_documents
@@ -145,23 +154,28 @@ def create_app() -> FastAPI:
 
         db = SessionLocal()
         try:
+            # 为已有仓库补默认会话，并移除旧的代码文件文档记录。
             backfill_all_default_conversations(db)
             if purge_legacy_code_documents(db):
                 db.commit()
         finally:
             db.close()
+        # 记录向量库状态；清理旧代码向量时允许 Milvus 暂时不可用。
         app.state.rag_vector_status = milvus_runtime_status()
         delete_milvus_documents(source_types=["code_file"], strict=False)
         if settings.auto_sync_enabled:
+            # 后台循环定期同步仓库，不阻塞启动流程。
             app.state.repo_sync_task = asyncio.create_task(periodic_repo_sync_loop())
 
     @app.on_event("shutdown")
     async def stop_background_tasks() -> None:
         task = getattr(app.state, "repo_sync_task", None)
         if task:
+            # 关闭应用时通知同步循环取消，避免留下后台任务。
             task.cancel()
 
     return app
 
 
+# uvicorn app.main:app 加载的就是这个应用实例。
 app = create_app()
